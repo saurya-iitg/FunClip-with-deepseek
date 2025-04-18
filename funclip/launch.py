@@ -15,7 +15,52 @@ from llm.qwen_api import call_qwen_model
 from llm.g4f_openai_api import g4f_openai_call
 from utils.trans_utils import extract_timestamps
 from introduction import top_md_1, top_md_3, top_md_4
+import lmstudio
+import requests
 
+LMSTUDIO_API_URL = "http://127.0.0.1:1234"
+
+def get_lmstudio_models():
+    try:
+        resp = requests.get(f"{LMSTUDIO_API_URL}/v1/models")
+        resp.raise_for_status()
+        data = resp.json()
+        # Adjust as per LM Studio's actual response
+        return [m['id'] for m in data.get('data', [])]
+    except Exception as e:
+        logging.warning(f"LM Studio model fetch error: {e}")
+        return []
+
+def get_lmstudio_loaded_model():
+    try:
+        resp = requests.get(f"{LMSTUDIO_API_URL}/v1/models")
+        resp.raise_for_status()
+        data = resp.json()
+        for m in data.get('data', []):
+            if m.get('status') == 'loaded':
+                return m['id']
+        return None
+    except Exception as e:
+        logging.warning(f"LM Studio loaded model fetch error: {e}")
+        return None
+
+def unload_all_lmstudio_models():
+    try:
+        # LM Studio may not have a direct "unload all" endpoint; try to unload each loaded model
+        models = get_lmstudio_models()
+        for model_id in models:
+            requests.post(f"{LMSTUDIO_API_URL}/v1/models/unload", json={"model": model_id})
+    except Exception as e:
+        logging.warning(f"LM Studio unload error: {e}")
+
+def load_lmstudio_model(model_id):
+    try:
+        resp = requests.post(f"{LMSTUDIO_API_URL}/v1/models/load", json={"model": model_id})
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        logging.warning(f"LM Studio load error: {e}")
+        return False
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='argparse testing')
@@ -116,18 +161,43 @@ if __name__ == "__main__":
             add_sub=True, dest_spk=video_spk_input, output_dir=output_dir
             )
         
-    def llm_inference(system_content, user_content, srt_text, model, apikey):
-        SUPPORT_LLM_PREFIX = ['qwen', 'gpt', 'g4f', 'moonshot', 'deepseek']
+    def llm_inference(system_content, user_content, srt_text, model, apikey, lmstudio_loaded_model):
+        SUPPORT_LLM_PREFIX = ['qwen', 'gpt', 'g4f', 'moonshot', 'deepseek', 'lmstudio']
+        # LM Studio local model
+        if model.startswith('lmstudio:'):
+            model_id = model.split(':', 1)[1]
+            # Unload and load model if needed
+            if lmstudio_loaded_model != model_id:
+                unload_all_lmstudio_models()
+                load_lmstudio_model(model_id)
+            # Call LM Studio OpenAI-compatible endpoint
+            url = f"{LMSTUDIO_API_URL}/v1/chat/completions"
+            payload = {
+                "model": model_id,
+                "messages": [
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": user_content + '\n' + srt_text}
+                ]
+            }
+            try:
+                resp = requests.post(url, json=payload)
+                resp.raise_for_status()
+                result = resp.json()
+                return result['choices'][0]['message']['content'], model_id
+            except Exception as e:
+                return f"LM Studio API error: {e}", model_id
+        # Remote models
         if model.startswith('qwen'):
-            return call_qwen_model(apikey, model, user_content+'\n'+srt_text, system_content)
+            return call_qwen_model(apikey, model, user_content+'\n'+srt_text, system_content), lmstudio_loaded_model
         if model.startswith('gpt') or model.startswith('moonshot') or model.startswith('deepseek'):
-            return openai_call(apikey, model, system_content, user_content+'\n'+srt_text)
+            return openai_call(apikey, model, system_content, user_content+'\n'+srt_text), lmstudio_loaded_model
         elif model.startswith('g4f'):
             model = "-".join(model.split('-')[1:])
-            return g4f_openai_call(model, system_content, user_content+'\n'+srt_text)
+            return g4f_openai_call(model, system_content, user_content+'\n'+srt_text), lmstudio_loaded_model
         else:
             logging.error("LLM name error, only {} are supported as LLM name prefix."
                           .format(SUPPORT_LLM_PREFIX))
+            return "LLM name error, only {} are supported as LLM name prefix.".format(SUPPORT_LLM_PREFIX), lmstudio_loaded_model
     
     def AI_clip(LLM_res, dest_text, video_spk_input, start_ost, end_ost, video_state, audio_state, output_dir):
         timestamp_list = extract_timestamps(LLM_res)
@@ -167,6 +237,7 @@ if __name__ == "__main__":
     
     # gradio interface
     theme = gr.Theme.load("funclip/utils/theme.json")
+    lmstudio_loaded_model = gr.State(None)
     with gr.Blocks(theme=theme) as funclip_service:
         gr.Markdown(top_md_1)
         # gr.Markdown(top_md_2)
@@ -209,17 +280,23 @@ if __name__ == "__main__":
                         prompt_head2 = gr.Textbox(label="Prompt User（不需要修改，会自动拼接左下角的srt字幕）", value=("这是待裁剪的视频srt字幕："))
                         with gr.Column():
                             with gr.Row():
+                                lmstudio_models = get_lmstudio_models()
+                                remote_models = [
+                                    "deepseek-chat",
+                                    "qwen-plus",
+                                    "gpt-3.5-turbo",
+                                    "gpt-3.5-turbo-0125",
+                                    "gpt-4-turbo",
+                                    "g4f-gpt-3.5-turbo"
+                                ]
+                                all_models = remote_models + [f"lmstudio:{m}" for m in lmstudio_models]
+
                                 llm_model = gr.Dropdown(
-                                    choices=[
-                                        "deepseek-chat"
-                                        "qwen-plus",
-                                             "gpt-3.5-turbo", 
-                                             "gpt-3.5-turbo-0125", 
-                                             "gpt-4-turbo",
-                                             "g4f-gpt-3.5-turbo"], 
-                                    value="deepseek-chat",
+                                    choices=all_models,
+                                    value=all_models[0] if all_models else None,
                                     label="LLM Model Name",
-                                    allow_custom_value=True)
+                                    allow_custom_value=True
+                                )
                                 apikey_input = gr.Textbox(label="APIKEY")
                             llm_button =  gr.Button("LLM推理 | LLM Inference（首先进行识别，非g4f需配置对应apikey）", variant="primary")
                         llm_result = gr.Textbox(label="LLM Clipper Result")
@@ -279,9 +356,11 @@ if __name__ == "__main__":
                                    font_color,
                                    ], 
                            outputs=[video_output, clip_message, srt_clipped])
-        llm_button.click(llm_inference,
-                         inputs=[prompt_head, prompt_head2, video_srt_output, llm_model, apikey_input],
-                         outputs=[llm_result])
+        llm_button.click(
+            llm_inference,
+            inputs=[prompt_head, prompt_head2, video_srt_output, llm_model, apikey_input, lmstudio_loaded_model],
+            outputs=[llm_result, lmstudio_loaded_model]
+        )
         llm_clip_button.click(AI_clip, 
                            inputs=[llm_result,
                                    video_text_input, 
